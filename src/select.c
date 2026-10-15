@@ -11,7 +11,10 @@
 #define GAP 6        /* space between the selection and its label/buttons */
 #define PAD 6        /* padding inside labels and buttons */
 #define MIN_SIZE 3   /* drags smaller than this count as a stray click */
-#define NUM_BUTTONS 3
+#define PEN_WIDTH 3
+#define NUM_BUTTONS 4
+#define BUTTON_DRAW 0 /* toggles draw mode instead of returning an action */
+#define NUM_COLORS 4
 
 typedef enum { STATE_IDLE, STATE_DRAGGING, STATE_CHOOSING } State;
 
@@ -22,14 +25,26 @@ typedef struct {
 } Button;
 
 typedef struct {
+  unsigned long pixel;
+  ShotRect clip; /* the selection at the time the stroke was drawn */
+  ShotRect bbox; /* the stroke's points, not counting pen width */
+  XPoint* pts;
+  int n, cap;
+} Stroke;
+
+typedef struct {
   Display* dpy;
+  XImage* frozen;
   Window win;
   Pixmap bright, dim, back;
   GC gc;
+  GC pen; /* color and clip are set per stroke by set_pen() */
   XFontStruct* font;
-  Cursor cross, hand;
+  Cursor cross, hand, pencil;
   int sw, sh;
   unsigned long col_border, col_bg, col_btn, col_btn_hover, col_text;
+  unsigned long pen_colors[NUM_COLORS];
+  unsigned long draw_btn_colors[NUM_COLORS]; /* darker, so the label stays readable */
 
   State state;
   int ax, ay, cx, cy; /* drag anchor and current pointer position */
@@ -39,6 +54,15 @@ typedef struct {
   char label[32];
   ShotRect label_rect;
   ShotRect drawn; /* area covered by the decorations currently on screen */
+
+  /* Draw mode: strokes go straight into `bright`, so they show up in the
+   * overlay and get copied into the screenshot at the end. They are also
+   * recorded so they can be undone. */
+  int draw_mode;
+  int color; /* index into pen_colors */
+  int stroking;
+  Stroke* strokes;
+  int nstrokes, cap_strokes;
 } Ctx;
 
 static int rect_empty(ShotRect r) {
@@ -199,9 +223,12 @@ static void redraw(Ctx* c, ShotRect damage) {
     draw_text_box(c, c->label_rect, c->label, c->col_bg);
 
     if (c->state == STATE_CHOOSING)
-      for (int i = 0; i < NUM_BUTTONS; i++)
-        draw_text_box(c, c->buttons[i].rect, c->buttons[i].text,
-                      i == c->hover ? c->col_btn_hover : c->col_btn);
+      for (int i = 0; i < NUM_BUTTONS; i++) {
+        unsigned long bg = i == c->hover                       ? c->col_btn_hover
+                           : i == BUTTON_DRAW && c->draw_mode ? c->draw_btn_colors[c->color]
+                                                              : c->col_btn;
+        draw_text_box(c, c->buttons[i].rect, c->buttons[i].text, bg);
+      }
   }
 
   XCopyArea(c->dpy, c->back, c->win, c->gc, damage.x, damage.y, damage.width, damage.height,
@@ -223,12 +250,101 @@ static int button_at(Ctx* c, int x, int y) {
   return -1;
 }
 
+static void refresh_cursor(Ctx* c) {
+  Cursor cursor = c->hover >= 0 ? c->hand : c->draw_mode ? c->pencil : c->cross;
+  XChangeActivePointerGrab(c->dpy, ButtonPressMask | ButtonReleaseMask | PointerMotionMask,
+                           cursor, CurrentTime);
+}
+
 static void set_hover(Ctx* c, int hover) {
   if (hover == c->hover) return;
   c->hover = hover;
-  XChangeActivePointerGrab(c->dpy, ButtonPressMask | ButtonReleaseMask | PointerMotionMask,
-                           hover >= 0 ? c->hand : c->cross, CurrentTime);
+  refresh_cursor(c);
   update(c);
+}
+
+static void set_draw_mode(Ctx* c, int on) {
+  c->draw_mode = on;
+  c->stroking = 0;
+  refresh_cursor(c);
+  update(c);
+}
+
+/* Makes room for `need` elements in a growable array. */
+static int reserve(void** items, int* cap, int need, size_t size) {
+  if (need <= *cap) return 0;
+  int n = *cap ? *cap * 2 : 64;
+  while (n < need) n *= 2;
+  void* grown = realloc(*items, (size_t)n * size);
+  if (!grown) return -1;
+  *items = grown;
+  *cap = n;
+  return 0;
+}
+
+static void set_pen(Ctx* c, unsigned long pixel, ShotRect clip) {
+  XRectangle r = {clip.x, clip.y, clip.width, clip.height};
+  XSetForeground(c->dpy, c->pen, pixel);
+  XSetClipRectangles(c->dpy, c->pen, 0, 0, &r, 1, Unsorted);
+}
+
+/* A zero-length segment draws a dot. */
+static void draw_segment(Ctx* c, XPoint a, XPoint b) {
+  if (a.x == b.x && a.y == b.y)
+    XFillArc(c->dpy, c->bright, c->pen, b.x - PEN_WIDTH / 2, b.y - PEN_WIDTH / 2, PEN_WIDTH,
+             PEN_WIDTH, 0, 360 * 64);
+  else
+    XDrawLine(c->dpy, c->bright, c->pen, a.x, a.y, b.x, b.y);
+}
+
+/* Draws every segment of `s`, the same way they were drawn live. */
+static void replay_stroke(Ctx* c, const Stroke* s) {
+  for (int i = 0; i < s->n; i++) draw_segment(c, s->pts[i ? i - 1 : 0], s->pts[i]);
+}
+
+/* Extends the current stroke to (x, y). */
+static void stroke_to(Ctx* c, int x, int y) {
+  Stroke* s = &c->strokes[c->nstrokes - 1];
+  XPoint p = {x, y};
+  XPoint prev = s->n ? s->pts[s->n - 1] : p;
+  if (s->n && prev.x == p.x && prev.y == p.y) return;
+  if (reserve((void**)&s->pts, &s->cap, s->n + 1, sizeof(XPoint)) != 0) return;
+  s->pts[s->n++] = p;
+
+  draw_segment(c, prev, p);
+  int x0 = x < prev.x ? x : prev.x, y0 = y < prev.y ? y : prev.y;
+  ShotRect seg = {x0, y0, abs(x - prev.x) + 1, abs(y - prev.y) + 1};
+  s->bbox = rect_union(s->bbox, seg);
+  redraw(c, rect_grow(seg, PEN_WIDTH));
+}
+
+static void begin_stroke(Ctx* c, int x, int y) {
+  if (reserve((void**)&c->strokes, &c->cap_strokes, c->nstrokes + 1, sizeof(Stroke)) != 0)
+    return;
+  c->strokes[c->nstrokes++] = (Stroke){.pixel = c->pen_colors[c->color], .clip = c->sel};
+  set_pen(c, c->pen_colors[c->color], c->sel);
+  c->stroking = 1;
+  stroke_to(c, x, y);
+}
+
+/* Removes the last stroke: restores the area it covered from the original
+ * capture, then repaints the remaining strokes that overlap that area. */
+static void undo(Ctx* c) {
+  if (c->stroking || c->nstrokes == 0) return;
+  Stroke* s = &c->strokes[--c->nstrokes];
+  ShotRect area = rect_intersect(rect_grow(s->bbox, PEN_WIDTH), s->clip);
+  free(s->pts);
+  if (rect_empty(area)) return;
+
+  XPutImage(c->dpy, c->bright, c->gc, c->frozen, area.x, area.y, area.x, area.y, area.width,
+            area.height);
+  for (int i = 0; i < c->nstrokes; i++) {
+    ShotRect clip = rect_intersect(c->strokes[i].clip, area);
+    if (rect_empty(clip)) continue;
+    set_pen(c, c->strokes[i].pixel, clip);
+    replay_stroke(c, &c->strokes[i]);
+  }
+  redraw(c, area);
 }
 
 static int grab_input(Ctx* c) {
@@ -256,6 +372,7 @@ static int setup(Ctx* c, Display* dpy, XImage* frozen) {
   Window root = RootWindow(dpy, scr);
   int depth = DefaultDepth(dpy, scr);
   c->dpy = dpy;
+  c->frozen = frozen;
   c->sw = frozen->width;
   c->sh = frozen->height;
   c->hover = -1;
@@ -287,14 +404,28 @@ static int setup(Ctx* c, Display* dpy, XImage* frozen) {
   c->col_bg = alloc_color(dpy, 0x20, 0x20, 0x20);
   c->col_btn = alloc_color(dpy, 0x30, 0x30, 0x30);
   c->col_btn_hover = alloc_color(dpy, 0x2a, 0x6e, 0xc8);
+  /* 1 = red, 2 = green, 3 = blue, 4 = yellow */
+  static const unsigned char pens[NUM_COLORS][3] = {
+    {0xff, 0x20, 0x20}, {0x20, 0xd0, 0x20}, {0x20, 0x60, 0xff}, {0xff, 0xd7, 0x00}};
+  static const unsigned char draw_btns[NUM_COLORS][3] = {
+    {0xb0, 0x24, 0x24}, {0x1e, 0x8a, 0x1e}, {0x24, 0x48, 0xb0}, {0x9a, 0x82, 0x00}};
+  for (int i = 0; i < NUM_COLORS; i++) {
+    c->pen_colors[i] = alloc_color(dpy, pens[i][0], pens[i][1], pens[i][2]);
+    c->draw_btn_colors[i] = alloc_color(dpy, draw_btns[i][0], draw_btns[i][1], draw_btns[i][2]);
+  }
   c->col_text = alloc_color(dpy, 0xf0, 0xf0, 0xf0);
 
   c->cross = XCreateFontCursor(dpy, XC_crosshair);
   c->hand = XCreateFontCursor(dpy, XC_hand2);
+  c->pencil = XCreateFontCursor(dpy, XC_pencil);
 
-  c->buttons[0] = (Button){{0}, "Save [s]", SHOT_ACTION_SAVE};
-  c->buttons[1] = (Button){{0}, "Copy [c]", SHOT_ACTION_COPY};
-  c->buttons[2] = (Button){{0}, "Cancel [Esc]", SHOT_ACTION_CANCEL};
+  c->pen = XCreateGC(dpy, root, 0, NULL);
+  XSetLineAttributes(dpy, c->pen, PEN_WIDTH, LineSolid, CapRound, JoinRound);
+
+  c->buttons[BUTTON_DRAW] = (Button){{0}, "Draw [d]", SHOT_ACTION_CANCEL};
+  c->buttons[1] = (Button){{0}, "Save [s]", SHOT_ACTION_SAVE};
+  c->buttons[2] = (Button){{0}, "Copy [c]", SHOT_ACTION_COPY};
+  c->buttons[3] = (Button){{0}, "Cancel [Esc]", SHOT_ACTION_CANCEL};
 
   XSetWindowAttributes wa = {
     .override_redirect = True,
@@ -323,11 +454,15 @@ static void teardown(Ctx* c) {
   if (c->win) XDestroyWindow(dpy, c->win);
   if (c->cross) XFreeCursor(dpy, c->cross);
   if (c->hand) XFreeCursor(dpy, c->hand);
+  if (c->pencil) XFreeCursor(dpy, c->pencil);
+  if (c->pen) XFreeGC(dpy, c->pen);
   if (c->font) XFreeFont(dpy, c->font);
   if (c->bright) XFreePixmap(dpy, c->bright);
   if (c->dim) XFreePixmap(dpy, c->dim);
   if (c->back) XFreePixmap(dpy, c->back);
   if (c->gc) XFreeGC(dpy, c->gc);
+  for (int i = 0; i < c->nstrokes; i++) free(c->strokes[i].pts);
+  free(c->strokes);
   XSync(dpy, False);
 }
 
@@ -342,8 +477,26 @@ static ShotAction run(Ctx* c) {
 
       case KeyPress: {
         KeySym sym = XLookupKeysym(&ev.xkey, 0);
+        /* Esc only leaves draw mode, so it can't throw away a drawing by accident. */
+        if (sym == XK_Escape && c->draw_mode) {
+          set_draw_mode(c, 0);
+          break;
+        }
         if (sym == XK_Escape || sym == XK_q) return SHOT_ACTION_CANCEL;
         if (c->state != STATE_CHOOSING) break;
+        if (sym == XK_d) {
+          set_draw_mode(c, !c->draw_mode);
+          break;
+        }
+        if (c->draw_mode && sym >= XK_1 && sym < XK_1 + NUM_COLORS) {
+          c->color = (int)(sym - XK_1);
+          update(c);
+          break;
+        }
+        if (c->draw_mode && sym == XK_u) {
+          undo(c);
+          break;
+        }
         if (sym == XK_s || sym == XK_Return || sym == XK_KP_Enter) return SHOT_ACTION_SAVE;
         if (sym == XK_c || sym == XK_y) return SHOT_ACTION_COPY;
         break;
@@ -354,7 +507,15 @@ static ShotAction run(Ctx* c) {
         if (ev.xbutton.button == Button3) return SHOT_ACTION_CANCEL;
         if (ev.xbutton.button != Button1) break;
         int b = button_at(c, x, y);
+        if (b == BUTTON_DRAW) {
+          set_draw_mode(c, !c->draw_mode);
+          break;
+        }
         if (b >= 0) return c->buttons[b].action;
+        if (c->draw_mode) {
+          begin_stroke(c, x, y);
+          break;
+        }
         /* Clicking anywhere else starts a fresh selection. */
         set_hover(c, -1);
         c->state = STATE_DRAGGING;
@@ -367,7 +528,9 @@ static ShotAction run(Ctx* c) {
       case MotionNotify: {
         while (XCheckTypedWindowEvent(c->dpy, c->win, MotionNotify, &ev)) {}
         int x = ev.xmotion.x_root, y = ev.xmotion.y_root;
-        if (c->state == STATE_DRAGGING) {
+        if (c->stroking) {
+          stroke_to(c, x, y);
+        } else if (c->state == STATE_DRAGGING) {
           c->cx = clamp(x, 0, c->sw - 1);
           c->cy = clamp(y, 0, c->sh - 1);
           update(c);
@@ -378,6 +541,10 @@ static ShotAction run(Ctx* c) {
       }
 
       case ButtonRelease:
+        if (ev.xbutton.button == Button1 && c->stroking) {
+          c->stroking = 0;
+          break;
+        }
         if (ev.xbutton.button != Button1 || c->state != STATE_DRAGGING) break;
         c->state = c->sel.width >= MIN_SIZE && c->sel.height >= MIN_SIZE ? STATE_CHOOSING
                                                                           : STATE_IDLE;
@@ -395,6 +562,9 @@ ShotAction shot_select(Display* dpy, XImage* frozen, ShotRect* rect_out) {
   if (setup(&c, dpy, frozen) == 0) {
     action = run(&c);
     *rect_out = c.sel;
+    if (action != SHOT_ACTION_CANCEL && c.nstrokes > 0)
+      XGetSubImage(dpy, c.bright, c.sel.x, c.sel.y, c.sel.width, c.sel.height, AllPlanes, ZPixmap,
+                   frozen, c.sel.x, c.sel.y);
   }
   teardown(&c);
   return action;

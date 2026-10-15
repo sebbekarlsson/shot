@@ -29,7 +29,8 @@ void shot_image_free(ShotImage* img);
 
 /* select.c
  * Shows `frozen` fullscreen and lets the user drag out a rectangle, then pick
- * what to do with it. Blocks until the user decides. */
+ * what to do with it. Blocks until the user decides. Anything drawn in draw
+ * mode is written back into `frozen`. */
 ShotAction shot_select(Display* dpy, XImage* frozen, ShotRect* rect_out);
 
 /* encode.c */
