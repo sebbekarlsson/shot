@@ -6,6 +6,11 @@ set(PROJ_NAME shot)
 
 project(${PROJ_NAME})
 
+# `make install` goes to ~/.local unless a prefix is given with -DCMAKE_INSTALL_PREFIX.
+if (CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+  set(CMAKE_INSTALL_PREFIX "$ENV{HOME}/.local" CACHE PATH "Install prefix" FORCE)
+endif()
+
 ######### DEBUG
 set(CMAKE_BUILD_TYPE RelWithDebInfo)
 
@@ -39,8 +44,6 @@ target_link_libraries(${PROJ_NAME} PUBLIC m jpeg png X11 Xrandr pthread atomic)
 target_compile_options(${PROJ_NAME} PUBLIC -Wall -mavx2 -mfma)
 target_include_directories(${PROJ_NAME} PUBLIC ${cglm_SOURCE_DIR}/include ${glfw_SOURCE_DIR}/include)
 
-install(TARGETS ${PROJ_NAME} DESTINATION bin)
-
 function (add_sub_project SUBPROJ_NAME)
   if (NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/exe/${SUBPROJ_NAME})
     make_directory(${CMAKE_CURRENT_SOURCE_DIR}/exe/${SUBPROJ_NAME}/src)
@@ -56,3 +59,5 @@ endfunction()
 
 
 add_sub_project(shot_cli)
+
+install(TARGETS shot_cli RUNTIME DESTINATION bin)
